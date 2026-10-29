@@ -45,10 +45,12 @@
 	<string>连接局域网内的桥接服务（你的电脑），用来接收指令和回传照片、录音。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<!-- 桥接跑在家里局域网的明文 HTTP 上，没有公网证书。 -->
+		<!-- 桥接跑在家里局域网的明文 HTTP 上，没有公网证书。
+		     注意：iOS 里一旦声明 NSAllowsLocalNetworking，NSAllowsArbitraryLoads 就会被忽略，
+		     而本地网络豁免只覆盖 .local / 无后缀主机名，不覆盖裸 IP 或内网域名的 https 下载，
+		     结果就是接口能连、但音频文件下载被 ATS 拦掉（"requires the use of a secure connection"）。
+		     所以这里只保留 NSAllowsArbitraryLoads，不做更细的豁免。 -->
 		<key>NSAllowsArbitraryLoads</key>
-		<true/>
-		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
 	<!-- canOpenURL 必须先声明，否则一律返回 false。 -->
