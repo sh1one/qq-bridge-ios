@@ -1,10 +1,10 @@
 name: iOS Build (unsigned IPA)
-
 # 触发方式（三选一）：
 #   1) 网页手动：Actions → 左侧 "iOS Build (unsigned IPA)" → Run workflow → Run workflow
 #   2) 命令行：gh workflow run ios-build.yml --repo <owner>/qq-bridge
 #   3) 推 tag：git tag ios-v1 && git push origin ios-v1
-# 产物：Actions run 页面底部 Artifacts → XiaoBeiMing-unsigned-ipa（zip 包里就是 XiaoBeiMing.ipa）
+# 产物：Actions run 页面底部 Artifacts → XiaoBeiMing-unsigned-ipa（zip 里就是 XiaoBeiMing.ipa）
+
 on:
   workflow_dispatch:
   push:
@@ -17,7 +17,7 @@ permissions:
 jobs:
   build:
     name: Build unsigned XiaoBeiMing.ipa
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
 
     steps:
