@@ -290,6 +290,26 @@ final class BridgeClient {
         return (obj as? [String: Any]) ?? [:]
     }
 
+    /// 常驻监听（CallKit）每切一段调一次：只把文字和这一段的起止时间/能量发给桥接。
+    /// 走主端口 3101 的 `/api/device/speech`，而不是感官通道的 utterance：
+    /// 常驻监听期间 3102 的实时音频流是停的（两个 engine 不能共存），不能再依赖它。
+    @discardableResult
+    func postSpeech(text: String,
+                    startedAt: Date,
+                    endedAt: Date,
+                    rms: Double,
+                    durationMs: Int) async throws -> [String: Any] {
+        let body: [String: Any] = [
+            "text": text,
+            "startedAt": Int64((startedAt.timeIntervalSince1970 * 1000).rounded()),
+            "endedAt": Int64((endedAt.timeIntervalSince1970 * 1000).rounded()),
+            "rms": rms,
+            "durationMs": durationMs
+        ]
+        let obj = try await send(path: "/api/device/speech", method: "POST", body: body, timeout: 8)
+        return (obj as? [String: Any]) ?? [:]
+    }
+
     func heartbeat(battery: Int,
                    charging: Bool,
                    mode: String,

@@ -39,6 +39,11 @@ final class DeviceController: ObservableObject {
     @Published var settings = AppSettings.load()
     /// WhisperKit 下载/加载/转写状态，设置页直接显示。
     @Published var asrState = ASRState()
+    /// 常驻监听（CallKit）的状态：设置页和 listenStart 命令都读这几项。
+    @Published var listenRunning = false
+    @Published var listenSegments = 0
+    @Published var listenLastText = ""
+    @Published var listenLastError = ""
 
     private let bridge = BridgeClient()
     private let keepAlive = KeepAlive()
@@ -49,6 +54,10 @@ final class DeviceController: ObservableObject {
     private let opener = OpenAppService()
     private let sense = SenseStream()
     private let asr = OnDeviceASR()
+    /// 常驻监听（CallKit）。它自带一份 BridgeClient 打 `/api/device/speech`，
+    /// 这样选路/配对随时改 baseURL 也不会把正在飞的那一段打断。
+    /// 用 lazy 是因为它要拿 `asr` 这个实例（同一个 WhisperKit，不重复 load 模型）。
+    private lazy var listen = ListenMode(asr: asr)
     private var router = EndpointRouter()
 
     private var heartbeatTask: Task<Void, Never>?
@@ -81,6 +90,16 @@ final class DeviceController: ObservableObject {
         settings = AppSettings.load()
         asr.onUpdate = { [weak self] state in
             self?.asrState = state
+        }
+        // ListenMode 的回调在主线程但不在 MainActor 上，照 sense.onState 的先例跳一次再写 @Published。
+        listen.onSnapshot = { [weak self] snapshot in
+            Task { @MainActor in
+                guard let self = self else { return }
+                self.listenRunning = snapshot.isRunning
+                self.listenSegments = snapshot.segments
+                self.listenLastText = snapshot.lastText
+                self.listenLastError = snapshot.lastError
+            }
         }
         lanURL = defaults.string(forKey: Keys.lanURL) ?? ""
         tailscaleURL = defaults.string(forKey: Keys.tailscaleURL) ?? ""
@@ -144,19 +163,41 @@ final class DeviceController: ObservableObject {
         }
     }
 
-    /// 保存端上识别相关设置。不动桥接连接，下一次 listen 生效。
+    /// 保存端上识别 + 常驻监听相关设置。不动桥接连接，下一次 listen 生效。
     func updateAppSettings(useOnDeviceASR: Bool,
                            model: OnDeviceModel,
                            vadSilenceMs: Int,
-                           vadThreshold: Double) {
+                           vadThreshold: Double,
+                           continuousListen: Bool) {
+        // 先记下开关的变化方向：下面写 settings 之后就分不出「本来就开着」和「刚打开」了。
+        let listenTurnedOn = continuousListen && !settings.continuousListen
+        let listenTurnedOff = !continuousListen && settings.continuousListen
         settings.useOnDeviceASR = useOnDeviceASR
         settings.onDeviceModel = model.rawValue
         settings.vadSilenceMs = max(200, min(3000, vadSilenceMs))
         settings.vadThreshold = max(0.005, min(0.2, vadThreshold))
+        settings.continuousListen = continuousListen
         settings.save()
+        syncListenEndpoint()
         // 第一次打开就按需下载并预编译；进度在设置页和 asrState 里。
         if settings.useOnDeviceASR {
             Task { await prepareASR() }
+        }
+        // 这个开关的语义是「现在就开始听 / 现在别听了」，所以立刻生效，不等下一次指令。
+        if listenTurnedOn {
+            guard awake, router.activeURL != nil else {
+                // 还没连上就先只提示：startLoops() 连上以后会按这个开关自动拉起。
+                listenLastError = "已保存；连上电脑后自动开始常驻监听"
+                return
+            }
+            Task { [weak self] in
+                guard let self = self else { return }
+                let outcome = await self.startContinuousListen()
+                if !outcome.ok { self.lastError = outcome.error }
+            }
+        } else if listenTurnedOff {
+            stopContinuousListen()
+            listenLastError = ""
         }
     }
 
@@ -223,7 +264,19 @@ final class DeviceController: ObservableObject {
             guard let self = self else { return }
             await self.pollLoop()
         }
-        startSense()
+        // 麦克风只有一只：常驻监听（CallKit）和实时感官通道（3102）共用不了。
+        // 两个 AVAudioEngine 同时读 inputNode 会互相打断（一个把会话切成 voiceChat，
+        // 另一个按 playAndRecord 抢回来），结果是两边都听不清。所以开关开着就把麦克风
+        // 交给常驻监听，关着才走实时音频流。
+        if settings.continuousListen {
+            Task { [weak self] in
+                guard let self = self else { return }
+                let outcome = await self.startContinuousListen()
+                if !outcome.ok { self.lastError = outcome.error }
+            }
+        } else {
+            startSense()
+        }
     }
 
     // MARK: - 实时感官通道（P1）
@@ -284,6 +337,72 @@ final class DeviceController: ObservableObject {
         sense.start(baseURL: baseURL, token: credential)
     }
 
+    // MARK: - 常驻监听（CallKit）
+
+    /// 把最新的通道/令牌/模型同步给常驻监听：它自己发 HTTP，用的是另一份 BridgeClient。
+    /// 选路切换、重新配对、改模型之后都要调，否则新段落会往旧地址发。
+    private func syncListenEndpoint() {
+        guard let base = router.activeURL ?? bridge.baseURL else { return }
+        let credential = deviceToken.isEmpty ? token : deviceToken
+        guard !credential.isEmpty else { return }
+        listen.configure(baseURL: base, token: credential, model: settings.onDeviceModel)
+    }
+
+    /// 起常驻监听；返回 (是否成功, 失败原因)。运行状态另外经 listen.onSnapshot 刷到 @Published。
+    ///
+    /// 这里集中处理三件互斥的事，顺序不能换：
+    /// 1) 单次录音在跑 → 直接拒绝（两路抢同一个麦克风，谁的声音都不完整）；
+    /// 2) `SenseStream` 的实时音频 → 先停（它有自己独立的 AVAudioEngine）；
+    /// 3) `KeepAlive` 的静音播放 → 先让出（常驻监听要自己占音频会话）。
+    private func startContinuousListen() async -> (ok: Bool, error: String) {
+        if listen.isRunning { return (true, "") }
+        if mic.isRecording {
+            return (false, "正在做单次录音，等它结束后再开常驻监听")
+        }
+        // 权限要在起 engine 之前问，否则 tap 装上了也拿不到数据。
+        guard await mic.requestPermission() else {
+            return (false, "没有麦克风权限：去「设置 → 小北冥 → 麦克风」打开")
+        }
+        guard let base = router.activeURL ?? bridge.baseURL else {
+            return (false, "还没有可用接入通道，转写出来的文字发不出去")
+        }
+        let credential = deviceToken.isEmpty ? token : deviceToken
+        guard !credential.isEmpty else {
+            return (false, "还没有设备令牌，先让 App 连上电脑")
+        }
+
+        sense.stop()
+        keepAlive.suspendForRecording()
+        listen.configure(baseURL: base, token: credential, model: settings.onDeviceModel)
+        var config = ListenMode.Config()
+        config.threshold = settings.vadThreshold
+        // 常驻监听沿用设置页那个「静音多久算说完」，不另立一套，用户调一次两边一致。
+        config.silenceMs = max(600, settings.vadSilenceMs)
+        guard listen.start(config: config) else {
+            // 起不来就把音频会话还回去，别让麦克风一直占着。
+            keepAlive.resumeAfterRecording()
+            if awake, router.activeURL != nil { startSense() }
+            let reason = listen.snapshot.lastError
+            return (false, reason.isEmpty ? "常驻监听启动失败" : reason)
+        }
+
+        // 模型没准备好就后台准备：不阻塞这条指令的返回；准备期间的段落会失败并记进 listenLastError。
+        if !asr.isReady(preferredModel: settings.onDeviceModel) {
+            Task { await prepareASR() }
+        }
+        lastError = ""
+        return (true, "")
+    }
+
+    /// 停常驻监听，并把麦克风还给实时感官通道。幂等：没在跑时什么也不做。
+    private func stopContinuousListen() {
+        guard listen.isRunning else { return }
+        // 顺序要紧：先停监听（它会 setActive(false)），再恢复保活播放，否则保活会被一起踢掉。
+        listen.stop()
+        keepAlive.resumeAfterRecording()
+        if awake, router.activeURL != nil { startSense() }
+    }
+
     private func stopAwake(reason: String) {
         awake = false
         UserDefaults.standard.set(false, forKey: Keys.awake)
@@ -295,6 +414,8 @@ final class DeviceController: ObservableObject {
         pollTask = nil
         keepAlive.stop()
         sense.stop()
+        // 待机/重连都要把麦克风彻底放掉：挂着 CallKit 通话不放，用户会以为 App 还在偷听。
+        listen.stop()
         camera.shutdown()
         speech.stopAll()
         haptics.stop()
@@ -340,6 +461,7 @@ final class DeviceController: ObservableObject {
             await pairIfNeeded()
         }
         connected = true
+        syncListenEndpoint()
         return true
     }
 
@@ -386,6 +508,7 @@ final class DeviceController: ObservableObject {
                 bridge.baseURL = router.activeURL
                 await pairIfNeeded()
                 updateChannelDisplay()
+                syncListenEndpoint()
                 return true
             }
             updateChannelDisplay()
@@ -397,6 +520,7 @@ final class DeviceController: ObservableObject {
                 bridge.baseURL = router.activeURL
                 updateChannelDisplay()
                 if !bridge.isPaired { await pairIfNeeded() }
+                syncListenEndpoint()
                 return true
             }
             updateChannelDisplay()
@@ -514,6 +638,24 @@ final class DeviceController: ObservableObject {
         var media: (ext: String, base64: String)?
         var ok = true
         var errorText = ""
+
+        // 常驻监听和单次录音互斥。放在 switch 之前，好让 "listen" 分支保持原样：
+        // 常驻监听占着麦克风时再接一次 listen，只会录到一段静音，还得跟 CallKit 抢音频会话。
+        if command.cmd == "listen", listen.isRunning {
+            data = [
+                "mode": "continuous",
+                "note": "常驻监听中，请改用文字流",
+                "segments": listenSegments,
+                "format": "text",
+            ]
+            audit(cmd: command.cmd, id: command.id, ok: true, error: "", data: data)
+            do {
+                try await bridge.report(id: command.id, ok: true, data: data, error: "", media: nil)
+            } catch {
+                lastError = "结果上报失败：\(Self.short(error))"
+            }
+            return
+        }
 
         switch command.cmd {
         case "look":
@@ -664,6 +806,38 @@ final class DeviceController: ObservableObject {
 
         case "ping":
             data = ["pong": true, "appVersion": BridgeClient.appVersion(), "mode": awake ? "awake" : "standby"]
+
+        case "listenStart":
+            // payload 为空即可：阈值/静音时长走设置，桥接不需要关心这些参数。
+            await showNotice("🎙 常驻监听（后台也听）· 由小北冥请求", hold: 4.0)
+            let started = await startContinuousListen()
+            data = [
+                "isRunning": listen.isRunning,
+                "segments": listenSegments,
+                "mode": "continuous",
+                "format": "text",
+                "sampleRate": 16000,
+            ]
+            if started.ok {
+                data["note"] = "音频只在手机本地转写，上传的是文字；停止用 listenStop"
+                if !asr.isReady(preferredModel: settings.onDeviceModel) {
+                    data["asr"] = "not-ready"
+                    data["asrHint"] = "模型未准备，段落会转写失败；先在设置页点「准备模型」"
+                }
+            } else {
+                ok = false
+                errorText = started.error
+            }
+
+        case "listenStop":
+            let wasRunning = listen.isRunning
+            stopContinuousListen()
+            data = [
+                "isRunning": listen.isRunning,
+                "segments": listenSegments,
+                "mode": "continuous",
+                "stopped": wasRunning,
+            ]
 
         default:
             ok = false

@@ -87,6 +87,10 @@ struct ContentView: View {
             StatusRow(label: "端点", value: controller.channelDetail, tint: .secondary)
             Divider().opacity(0.25)
             StatusRow(label: "她正在", value: controller.activity, tint: .purple)
+            if controller.listenRunning {
+                Divider().opacity(0.25)
+                StatusRow(label: "常驻监听", value: listenSummary, tint: .green)
+            }
             if !controller.lastError.isEmpty {
                 Divider().opacity(0.25)
                 StatusRow(label: "最近错误", value: controller.lastError, tint: .red)
@@ -94,6 +98,12 @@ struct ContentView: View {
         }
         .padding(.vertical, 4)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    /// 首页只显示「几段 · 最近一句开头」，整段文字留给设置页。
+    private var listenSummary: String {
+        let text = controller.listenLastText.isEmpty ? "在听" : clipped(controller.listenLastText, limit: 40)
+        return "\(controller.listenSegments) 段 · \(text)"
     }
 
     private var bigButton: some View {
@@ -187,6 +197,7 @@ struct SettingsView: View {
     @State private var useOnDeviceASR: Bool = true
     @State private var asrModel: OnDeviceModel = .small
     @State private var vadSilenceMs: Int = 800
+    @State private var continuousListen: Bool = false
 
     var body: some View {
         NavigationStack {
@@ -263,12 +274,51 @@ struct SettingsView: View {
                         .font(.caption2)
                 }
                 Section {
+                    Toggle("常驻监听（后台也听）", isOn: $continuousListen)
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(controller.listenRunning ? Color.green : Color.secondary.opacity(0.45))
+                            .frame(width: 7, height: 7)
+                        Text(controller.listenRunning ? "正在听（挂着 CallKit 通话）" : "未运行")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Text("已采集 \(controller.listenSegments) 段")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 10) {
+                        Text("最近一段")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 12)
+                        Text(listenLine)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    if !controller.listenLastError.isEmpty {
+                        Text(controller.listenLastError)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("常驻监听")
+                } footer: {
+                    Text(continuousListen
+                         ? "会挂一通「小北冥」的假通话（CallKit）来保住麦克风：锁屏、后台都能继续听。声音只在手机本地转成文字，只把文字发给电脑；转写失败的段直接丢掉。"
+                         : "需要 App 在前台，锁屏会停。打开后会挂一通假通话来保住麦克风，锁屏也能继续听。")
+                        .font(.caption2)
+                }
+                Section {
                     Button("保存并重连") {
                         controller.updateAppSettings(
                             useOnDeviceASR: useOnDeviceASR,
                             model: asrModel,
                             vadSilenceMs: vadSilenceMs,
-                            vadThreshold: controller.settings.vadThreshold
+                            vadThreshold: controller.settings.vadThreshold,
+                            continuousListen: continuousListen
                         )
                         controller.saveSettings(lan: lan, tailscale: tailscale, tunnel: tunnel, token: token)
                         showSettings = false
@@ -293,11 +343,26 @@ struct SettingsView: View {
                 useOnDeviceASR = controller.settings.useOnDeviceASR
                 asrModel = controller.settings.model
                 vadSilenceMs = controller.settings.vadSilenceMs
+                continuousListen = controller.settings.continuousListen
             }
         }
+    }
+
+    /// 最近一段只显示开头 40 字：整句话会把设置页那一行撑开。
+    private var listenLine: String {
+        let text = controller.listenLastText
+        if text.isEmpty { return controller.listenRunning ? "还没听到说话" : "—" }
+        return clipped(text, limit: 40)
     }
 
     private var hasEndpoint: Bool {
         [lan, tailscale, tunnel].contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
+}
+
+/// 把一段文字压成一行（保留前 `limit` 个字符）。状态行、最近转写都用它。
+private func clipped(_ text: String, limit: Int) -> String {
+    let flat = text.replacingOccurrences(of: "\n", with: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return flat.count <= limit ? flat : String(flat.prefix(limit)) + "…"
 }

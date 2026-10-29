@@ -42,6 +42,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.xiaobeiming.senses
         INFOPLIST_FILE: Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
+        # 图标：Resources/Assets.xcassets/AppIcon.appiconset（1024 单尺寸，Xcode 自动派生其余规格）
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: "NO"
         # AltStore 免费证书只签 7 天，但构建产物本身不需要任何 profile。
