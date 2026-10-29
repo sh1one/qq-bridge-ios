@@ -1,0 +1,4 @@
+﻿build/
+*.xcactivitylog
+.DS_Store
+

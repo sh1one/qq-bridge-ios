@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>小北冥</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UIUserInterfaceStyle</key>
+	<string>Dark</string>
+	<!-- 保活：只开 audio。没有 location / fetch / processing，避免"后台偷跑"的语义。 -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>拍照给你看眼前的东西。只有桥接下发的拍照指令才会打开摄像头，执行前屏幕上会出现可见提示。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>录一小段环境声音给你听。只有桥接下发的录音指令才会录音，执行前屏幕上会出现可见提示。默认在手机本地识别成文字，音频不上传。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>连接局域网内的桥接服务（你的电脑），用来接收指令和回传照片、录音。</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- 桥接跑在家里局域网的明文 HTTP 上，没有公网证书。 -->
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<!-- canOpenURL 必须先声明，否则一律返回 false。 -->
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>weixin</string>
+		<string>weixinULAPI</string>
+		<string>alipays</string>
+		<string>mqq</string>
+		<string>mqqapi</string>
+		<string>camera</string>
+		<string>photos-redirect</string>
+		<string>shortcuts</string>
+		<string>App-Prefs</string>
+		<string>prefs</string>
+		<string>instagram</string>
+		<string>twitter</string>
+		<string>facebook</string>
+		<string>whatsapp</string>
+		<string>tel</string>
+		<string>sms</string>
+		<string>mailto</string>
+	</array>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+</dict>
+</plist>

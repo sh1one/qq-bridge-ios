@@ -1,0 +1,60 @@
+name: XiaoBeiMing
+options:
+  bundleIdPrefix: com.xiaobeiming
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+# 未签名构建：GitHub Actions 上不碰证书，产出未签名 .app → 打包成 ipa，
+# 由 Windows 侧的 AltStore 用用户自己的 Apple ID 重签后安装。
+settings:
+  base:
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    ENABLE_BITCODE: "NO"
+    SWIFT_VERSION: "5.0"
+    ALWAYS_SEARCH_USER_PATHS: "NO"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+# 端上识别：WhisperKit 0.9.0（SwiftPM）。包本身 platforms 为 iOS 16，
+# 与 deploymentTarget 一致；exactVersion 是为了锁住代码里用到的 API。
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit
+    exactVersion: 0.9.0
+
+targets:
+  XiaoBeiMing:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources
+    dependencies:
+      - package: WhisperKit
+    settings:
+      base:
+        PRODUCT_NAME: XiaoBeiMing
+        PRODUCT_BUNDLE_IDENTIFIER: com.xiaobeiming.senses
+        INFOPLIST_FILE: Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: "NO"
+        # AltStore 免费证书只签 7 天，但构建产物本身不需要任何 profile。
+        PROVISIONING_PROFILE_SPECIFIER: ""
+
+schemes:
+  XiaoBeiMing:
+    build:
+      targets:
+        XiaoBeiMing: all
+    run:
+      config: Release
+    archive:
+      config: Release
+    test:
+      config: Release

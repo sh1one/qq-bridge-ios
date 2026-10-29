@@ -1,0 +1,93 @@
+name: iOS Build (unsigned IPA)
+
+# 触发方式（三选一）：
+#   1) 网页手动：Actions → 左侧 "iOS Build (unsigned IPA)" → Run workflow → Run workflow
+#   2) 命令行：gh workflow run ios-build.yml --repo <owner>/qq-bridge
+#   3) 推 tag：git tag ios-v1 && git push origin ios-v1
+# 产物：Actions run 页面底部 Artifacts → XiaoBeiMing-unsigned-ipa（zip 包里就是 XiaoBeiMing.ipa）
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "ios-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned XiaoBeiMing.ipa
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: |
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Install xcodegen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      # 根据 project.yml 生成 XiaoBeiMing.xcodeproj。仓库里不提交 pbxproj，
+      # 避免手写工程文件在 Xcode 版本之间漂移。
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate --spec project.yml
+
+      # 关键：CODE_SIGNING_ALLOWED=NO 产出未签名 .app。
+      # 不碰证书、不碰 provisioning profile，所以免费 Apple ID 也能在
+      # Windows 侧用 AltStore 重新签名安装。
+      - name: Build (Release, unsigned)
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project XiaoBeiMing.xcodeproj \
+            -scheme XiaoBeiMing \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee build.log
+
+      - name: Package into ipa
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/XiaoBeiMing.app"
+          test -d "$APP" || { echo "找不到 $APP"; tail -n 80 build.log; exit 1; }
+          test -f "$APP/silence.wav" || echo "警告：silence.wav 没被拷进 bundle，保活会失效"
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry XiaoBeiMing.ipa Payload
+          ls -lh XiaoBeiMing.ipa
+          shasum -a 256 XiaoBeiMing.ipa | tee SHA256SUMS.txt
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" Payload/XiaoBeiMing.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" Payload/XiaoBeiMing.app/Info.plist
+
+      - name: Upload ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XiaoBeiMing-unsigned-ipa
+          path: |
+            ios/XiaoBeiMing.ipa
+            ios/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ios/build.log
+          if-no-files-found: ignore
