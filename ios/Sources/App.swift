@@ -102,7 +102,7 @@ struct ContentView: View {
 
     /// 首页只显示「几段 · 最近一句开头」，整段文字留给设置页。
     private var listenSummary: String {
-        let text = controller.listenLastText.isEmpty ? "在听" : clipped(controller.listenLastText, limit: 40)
+        let text = controller.listenLastText.isEmpty ? "在听" : shortText(controller.listenLastText, limit: 40)
         return "\(controller.listenSegments) 段 · \(text)"
     }
 
@@ -352,7 +352,7 @@ struct SettingsView: View {
     private var listenLine: String {
         let text = controller.listenLastText
         if text.isEmpty { return controller.listenRunning ? "还没听到说话" : "—" }
-        return clipped(text, limit: 40)
+        return shortText(text, limit: 40)
     }
 
     private var hasEndpoint: Bool {
@@ -361,7 +361,7 @@ struct SettingsView: View {
 }
 
 /// 把一段文字压成一行（保留前 `limit` 个字符）。状态行、最近转写都用它。
-private func clipped(_ text: String, limit: Int) -> String {
+private func shortText(_ text: String, limit: Int) -> String {
     let flat = text.replacingOccurrences(of: "\n", with: " ")
         .trimmingCharacters(in: .whitespacesAndNewlines)
     return flat.count <= limit ? flat : String(flat.prefix(limit)) + "…"
