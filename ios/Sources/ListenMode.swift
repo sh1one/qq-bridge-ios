@@ -82,7 +82,7 @@ final class ListenMode: NSObject, CXProviderDelegate {
         /// 单段最长时长：超过就硬切，否则一句话能拖到几十秒，WhisperKit 也不划算。
         var maxSegmentSec: Double = 20
         /// 人声判定阈值（线性 RMS），和 MicService / AppSettings 同一个语义。
-        var threshold: Double = 0.02
+        var threshold: Double = 0.006
     }
 
     /// 每次状态变化都回调（已经在主线程上）。
