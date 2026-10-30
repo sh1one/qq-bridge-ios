@@ -173,8 +173,10 @@ final class ListenMode: NSObject, CXProviderDelegate {
     // MARK: - 生命周期
 
     /// 起监听。返回 false 时原因在 `snapshot.lastError` 里（权限 / 会话 / 引擎）。
+    /// `withCall = false` 时不报 CallKit 通话，只靠"静音保活 + 音频会话"续命：
+    /// 锁屏不一定还能录，但前台/亮屏一定可用，是被系统反复重置通话时的降级路径。
     @discardableResult
-    func start(config newConfig: Config? = nil) -> Bool {
+    func start(config newConfig: Config? = nil, withCall: Bool = true) -> Bool {
         if isRunning { return true }
         // 一旦起过就记住「用户想一直听」，系统重置通话后才能自己拉回来。
         UserDefaults.standard.set(true, forKey: Self.wantsKey)
@@ -206,7 +208,7 @@ final class ListenMode: NSObject, CXProviderDelegate {
         }
         // 顺序有意为之：先让系统认为在通话，再起引擎。反过来的话引擎拿到的输入格式
         // 可能还是通话前的（48kHz 立体声），CallKit 一切换就得重装 tap。
-        startCall()
+        if withCall { startCall() }
         do {
             try startCapture()
         } catch {
@@ -540,6 +542,14 @@ final class ListenMode: NSObject, CXProviderDelegate {
     /// 让系统进入「通话中」。这是后台持续收音的关键：CallKit 通话里的音频会话有通话优先级，
     /// 锁屏/切后台时系统不会像对普通 App 那样把输入掐掉。
     private func startCall() {
+        // CallKit 要求在主线程上发起：从后台 Task 直接 request 会被系统判为无效并触发 providerDidReset。
+        // 之前就是踩了这个坑（表现为"系统重置了通话状态"反复出现）。
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.startCall()
+            }
+            return
+        }
         let configuration = CXProviderConfiguration(localizedName: "小北冥")
         // .generic 是唯一不需要电话号码/邮箱的 handle 类型。
         configuration.supportedHandleTypes = [.generic]
@@ -632,6 +642,18 @@ final class ListenMode: NSObject, CXProviderDelegate {
         runSync { self.state.wants } || UserDefaults.standard.bool(forKey: Self.wantsKey)
     }
 
+    /// 降级：不再报 CallKit 通话，只用音频会话 + 保活播放顶着。前台/亮屏照常能听，
+    /// 锁屏能不能听就看系统给不给后台输入——比"完全停掉"强，也避免重置死循环。
+    private func degradeToCallLess() {
+        guard isWanted, !isRunning else { return }
+        if start(withCall: false) {
+            print("[LISTEN] 已降级为无通话监听")
+        } else {
+            let reason = snapshot.lastError
+            report(error: "降级启动失败：\(reason.isEmpty ? "未知原因" : reason)")
+        }
+    }
+
     /// 被系统收走通话后自己拉回来。延迟 1.5 秒是给 CallKit 和音频会话留落定时间：
     /// 立刻再 report 一通，很容易触发第二次重置（真机上试过）。
     /// 五分钟里连着重置 5 次就停手，否则会陷入"重置→重拉→再重置"的死循环，白耗电还吵。
@@ -640,9 +662,8 @@ final class ListenMode: NSObject, CXProviderDelegate {
         let now = Date()
         autoRestartTimes = autoRestartTimes.filter { now.timeIntervalSince($0) < 300 }
         guard autoRestartTimes.count < 5 else {
-            report(error: "通话反复被系统重置（5 分钟内 \(autoRestartTimes.count) 次），已停止尝试；请重新打开常驻监听")
-            UserDefaults.standard.set(false, forKey: Self.wantsKey)
-            runSync { self.state.wants = false }
+            report(error: "通话反复被系统重置，已降级为「不用通话」的保活监听（锁屏时可能听不到）")
+            degradeToCallLess()
             return
         }
         autoRestartTimes.append(now)
