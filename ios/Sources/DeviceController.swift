@@ -587,8 +587,7 @@ final class DeviceController: ObservableObject {
                                                                 "callActive": ls.callActive,
                                                                 "segments": ls.segments,
                                                                 "pending": ls.pending,
-                                                                // 采集诊断：frames 是 tap 收到的帧数，peak 是近期峰值电平。
-                                                                // 线上排"0 段"时，这两个数比任何日志都快。
+                                                                // 采集诊断：frames 不涨 = 没数据；frames 涨而 peak≈0 = 被系统静音。
                                                                 "frames": ls.frames,
                                                                 "peak": ls.peak,
                                                                 "lastError": ls.lastError])
