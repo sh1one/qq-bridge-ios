@@ -69,13 +69,16 @@ final class ListenMode: NSObject, CXProviderDelegate {
     struct Config {
         var sampleRate: Double = 16_000
         /// 连续高于阈值多久算「开始说话」。
-        var onsetMs: Int = 300
+        var onsetMs: Int = 500
+        /// 连续高于阈值多久算「开始说话」。刻意小于 onsetMs：
+        /// 门槛太大时「吗 / 冷 / 想」这种半秒内的短尾巴会被整段丢掉。
+        var confirmMs: Int = 180
         /// 说话中静音多久算「这一段结束」。
-        var silenceMs: Int = 1000
+        var silenceMs: Int = 900
         /// 收尾时保留的尾部静音。全剪掉会把最后一个字的尾音削掉，留一点更稳。
         var tailKeepMs: Int = 200
         /// 单段最短时长：低于这个当咳嗽/碰撞丢掉，别拿去浪费一次转写。
-        var minSegmentSec: Double = 0.6
+        var minSegmentSec: Double = 0.35
         /// 单段最长时长：超过就硬切，否则一句话能拖到几十秒，WhisperKit 也不划算。
         var maxSegmentSec: Double = 20
         /// 人声判定阈值（线性 RMS），和 MicService / AppSettings 同一个语义。
@@ -425,7 +428,7 @@ final class ListenMode: NSObject, CXProviderDelegate {
             }
             if voiced {
                 voicedRunMs += frameMs
-                if voicedRunMs >= Double(config.onsetMs) {
+                if voicedRunMs >= Double(config.confirmMs) {
                     // 起音确认：pre-roll 里正好含这 300ms，整段当作开头，第一个字不会被吞。
                     speaking = true
                     silenceRunMs = 0
