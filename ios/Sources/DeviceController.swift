@@ -587,6 +587,10 @@ final class DeviceController: ObservableObject {
                                                                 "callActive": ls.callActive,
                                                                 "segments": ls.segments,
                                                                 "pending": ls.pending,
+                                                                // 采集诊断：frames 是 tap 收到的帧数，peak 是近期峰值电平。
+                                                                // 线上排"0 段"时，这两个数比任何日志都快。
+                                                                "frames": ls.frames,
+                                                                "peak": ls.peak,
                                                                 "lastError": ls.lastError])
                 router.noteSuccess()
                 connected = true
