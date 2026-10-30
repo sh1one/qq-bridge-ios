@@ -76,7 +76,7 @@ final class ListenMode: NSObject, CXProviderDelegate {
         /// 说话中静音多久算「这一段结束」。
         var silenceMs: Int = 900
         /// 收尾时保留的尾部静音。全剪掉会把最后一个字的尾音削掉，留一点更稳。
-        var tailKeepMs: Int = 200
+        var tailKeepMs: Int = 400
         /// 单段最短时长：低于这个当咳嗽/碰撞丢掉，别拿去浪费一次转写。
         var minSegmentSec: Double = 0.35
         /// 单段最长时长：超过就硬切，否则一句话能拖到几十秒，WhisperKit 也不划算。
