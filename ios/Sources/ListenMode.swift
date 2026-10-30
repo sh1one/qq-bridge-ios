@@ -40,6 +40,10 @@ struct ListenSnapshot {
     var lastSegmentMs = 0
     /// 用户「想要一直听」的意图（持久化）。系统重置通话后按这个决定要不要自己拉回来。
     var wants = false
+    /// 采集链路诊断：tap 收到多少帧、最近电平峰值多少。
+    /// 用来区分两种"0 段"：frames 不涨 = 麦克风根本没数据；frames 涨但 peak 远低于阈值 = 阈值/增益问题。
+    var frames = 0
+    var peak: Double = 0
 }
 
 /// 常驻监听（CallKit 版）：让 App 表现得像一通正在进行的语音通话，锁屏/后台继续用麦克风。
@@ -363,6 +367,10 @@ final class ListenMode: NSObject, CXProviderDelegate {
 
     /// 串行队列。所有时长都按「实际帧长」累加，不假设固定 buffer 大小（48k 时一帧 42ms，16k 时 128ms）。
     private func ingest(_ samples: [Float], rms: Float) {
+        // 诊断计数：tap 是否真的在来数据、电平有没有到阈值，靠这两个数在心跳里看。
+        // 采不到音时 frames 不涨；frames 涨而 peak 长期 < threshold 才是阈值问题。
+        state.frames += 1
+        state.peak = max(state.peak * 0.95, Double(rms))
         guard state.isRunning, !samples.isEmpty else { return }
         let frameMs = Double(samples.count) / config.sampleRate * 1000
         let voiced = Double(rms) >= config.threshold
