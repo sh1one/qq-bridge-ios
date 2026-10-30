@@ -191,6 +191,48 @@ final class BridgeClient {
         return obj
     }
 
+    /// 二进制上行（常驻监听切好的 wav）。和 send 的区别只有请求体与 Content-Type，
+    /// 鉴权、超时、错误码解析保持一致，避免两套写法漂移。
+    private func sendRaw(path: String,
+                         body: Data,
+                         contentType: String,
+                         headers extra: [String: String],
+                         timeout: TimeInterval) async throws -> Any {
+        let url = try makeURL(path)
+        let token = self.token
+        guard !token.isEmpty else { throw BridgeError.notConfigured }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.setValue(token, forHTTPHeaderField: "x-device-token")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        for (k, v) in extra { req.setValue(v, forHTTPHeaderField: k) }
+        req.httpBody = body
+        let data: Data
+        let resp: URLResponse
+        do {
+            (data, resp) = try await session.data(for: req)
+        } catch let error as URLError {
+            throw BridgeError.network("\(error.code.rawValue) \(error.localizedDescription)")
+        } catch {
+            throw BridgeError.network(error.localizedDescription)
+        }
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let text = String(data: data, encoding: .utf8) ?? ""
+        if code != 200 {
+            var detail = Self.trimmedSnippet(text)
+            if let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let serverCode = obj["code"] as? String {
+                detail = serverCode
+            }
+            throw BridgeError.http(code, detail)
+        }
+        guard !data.isEmpty else { return [String: Any]() }
+        return (try? JSONSerialization.jsonObject(with: data)) ?? [String: Any]()
+    }
+
     private static func trimmedSnippet(_ text: String) -> String {
         let flat = text.replacingOccurrences(of: "\n", with: " ")
         if flat.count <= 200 { return flat }
@@ -308,6 +350,30 @@ final class BridgeClient {
         ]
         let obj = try await send(path: "/api/device/speech", method: "POST", body: body, timeout: 8)
         return (obj as? [String: Any]) ?? [:]
+    }
+
+    /// 常驻监听改为「只传音频」：电脑侧常驻 faster-whisper 转写，比端上 small 模型稳得多。
+    /// 服务端返回 ok=false（例如没人声）时不算错误，返回 nil 让调用方跳过这一段。
+    func postSpeechAudio(wav: Data,
+                         startedAt: Date,
+                         endedAt: Date,
+                         rms: Double,
+                         durationMs: Int) async throws -> String? {
+        let headers: [String: String] = [
+            "x-started-at": String(Int64((startedAt.timeIntervalSince1970 * 1000).rounded())),
+            "x-ended-at": String(Int64((endedAt.timeIntervalSince1970 * 1000).rounded())),
+            "x-rms": String(format: "%.4f", rms),
+            "x-duration-ms": String(durationMs)
+        ]
+        let obj = try await sendRaw(path: "/api/device/speech-audio",
+                                   body: wav,
+                                   contentType: "audio/wav",
+                                   headers: headers,
+                                   timeout: 20)
+        let dict = (obj as? [String: Any]) ?? [:]
+        if (dict["ok"] as? Bool) == false { return nil }
+        let text = (dict["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return text.isEmpty ? nil : text
     }
 
     func heartbeat(battery: Int,
