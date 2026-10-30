@@ -71,7 +71,7 @@ final class ListenMode: NSObject, CXProviderDelegate {
         /// 连续高于阈值多久算「开始说话」。
         var onsetMs: Int = 300
         /// 说话中静音多久算「这一段结束」。
-        var silenceMs: Int = 800
+        var silenceMs: Int = 1000
         /// 收尾时保留的尾部静音。全剪掉会把最后一个字的尾音削掉，留一点更稳。
         var tailKeepMs: Int = 200
         /// 单段最短时长：低于这个当咳嗽/碰撞丢掉，别拿去浪费一次转写。
@@ -936,9 +936,16 @@ final class ListenMode: NSObject, CXProviderDelegate {
         let bits = 16
         let byteRate = rate * channels * bits / 8
         let blockAlign = channels * bits / 8
+        // 远场/轻声时音量常常只有 -40dB 左右，whisper 对这种小音量很敏感：把这段人声拉到目标 RMS（最多 6 倍）。
+        let targetRMS = 0.07
+        var sumSquares: Double = 0
+        for value in samples { sumSquares += Double(value) * Double(value) }
+        let currentRMS = samples.isEmpty ? 0 : sqrt(sumSquares / Double(samples.count))
+        var gain: Double = 1.0
+        if currentRMS > 0.002, currentRMS < targetRMS { gain = min(6.0, targetRMS / currentRMS) }
         var pcm = [Int16](repeating: 0, count: samples.count)
         for (index, value) in samples.enumerated() {
-            let clamped = max(-1.0, min(1.0, Double(value)))
+            let clamped = max(-1.0, min(1.0, Double(value) * gain))
             pcm[index] = Int16(clamped * 32767.0)
         }
 
