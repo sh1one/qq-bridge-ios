@@ -475,8 +475,11 @@ final class ListenMode: NSObject, CXProviderDelegate {
             return
         }
         let text: String
+        var alreadyStored = false
         do {
-            text = try await transcribe(segment)
+            let outcome = try await transcribe(segment)
+            text = outcome.text
+            alreadyStored = outcome.stored
         } catch {
             let detail = Self.describe(error)
             print("[LISTEN] transcribe failed: \(detail)")
@@ -488,29 +491,78 @@ final class ListenMode: NSObject, CXProviderDelegate {
             finish(error: "")
             return
         }
-        do {
-            try await post(segment, text: text)
-        } catch {
-            // 网络断：这一段直接丢，不重试——重试只会把下一段堵在队列里。
-            let detail = Self.describe(error)
-            print("[LISTEN] post failed: \(detail)")
-            finish(error: "上报失败（已丢弃该段）：\(detail)")
-            return
+        if !alreadyStored {
+            do {
+                try await post(segment, text: text)
+            } catch {
+                // 网络断：这一段直接丢，不重试——重试只会把下一段堵在队列里。
+                let detail = Self.describe(error)
+                print("[LISTEN] post failed: \(detail)")
+                finish(error: "上报失败（已丢弃该段）：\(detail)")
+                return
+            }
         }
         print(String(format: "[LISTEN] seg %dms rms=%.3f chars=%d", segment.durationMs, segment.rms, text.count))
         finish(text: text, error: "")
     }
 
-    private func transcribe(_ segment: Segment) async throws -> String {
+    /// 一段音频 → 文字。优先走电脑侧常驻 faster-whisper（中文明显准），
+    /// 服务不可用或判定没人声时才退回端上 WhisperKit small。
+    /// 注意：服务端成功时它自己已经把记录写进 speech.jsonl，这里不再重复 POST 文字。
+    private func transcribe(_ segment: Segment) async throws -> (text: String, stored: Bool) {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("listen-\(UUID().uuidString.prefix(8)).wav")
         // 无论成功失败都删：常驻监听一天能切上千段，临时文件漏了会吃满空间。
         defer { try? FileManager.default.removeItem(at: url) }
         let data = Self.wavData(samples: segment.samples, sampleRate: segment.sampleRate)
         try data.write(to: url, options: .atomic)
+
+        // 1) 电脑侧转写（成功即已落库）
+        switch try await transcribeOnServer(wav: data, segment: segment) {
+        case .spoken(let text):
+            return (text, true)
+        case .empty:
+            // 服务端判定这段没有人声：直接当空段，别再让端上模型去猜（猜出来的就是“字幕:…”）。
+            return ("", true)
+        case .unavailable:
+            break
+        }
+
+        // 2) 端上兜底
         let runtime = runSync { self.runtime }
         let text = try await asr.transcribeSegment(at: url, preferredModel: runtime.model)
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (text.trimmingCharacters(in: .whitespacesAndNewlines), false)
+    }
+
+    private enum ServerTranscribe {
+        case spoken(String)
+        case empty
+        case unavailable
+    }
+
+    /// 电脑侧转写结果。`.unavailable` 才是"该退回端上"的信号；
+    /// `.empty` 表示服务端确定这段是人声以外的声音，直接丢弃。
+    private func transcribeOnServer(wav: Data, segment: Segment) async throws -> ServerTranscribe {
+        let runtime = runSync { self.runtime }
+        guard let base = runtime.baseURL, !runtime.token.isEmpty else { return .unavailable }
+        bridge.baseURL = base
+        bridge.bootstrapToken = runtime.token
+        bridge.deviceToken = ""
+        do {
+            let text = try await bridge.postSpeechAudio(wav: wav,
+                                                        startedAt: segment.startedAt,
+                                                        endedAt: segment.endedAt,
+                                                        rms: segment.rms,
+                                                        durationMs: segment.durationMs)
+            if let text, !text.isEmpty { return .spoken(text) }
+            return .empty
+        } catch {
+            // 服务端不可用不是错误：退回端上转写，界面上只留一行提示。
+            let detail = Self.describe(error)
+            print("[LISTEN] server transcribe failed: \(detail)")
+            update { $0.lastError = "电脑侧转写不可用，改用手机本地识别（\(detail)）" }
+            return .unavailable
+        }
     }
 
     private func post(_ segment: Segment, text: String) async throws {
