@@ -398,7 +398,8 @@ final class DeviceController: ObservableObject {
     private func stopContinuousListen() {
         guard listen.isRunning else { return }
         // 顺序要紧：先停监听（它会 setActive(false)），再恢复保活播放，否则保活会被一起踢掉。
-        listen.stop()
+        // 走 stopByUser：用户手动关掉就顺手清掉「一直听」的意图，否则下次连上会被自动拉起。
+        listen.stopByUser()
         keepAlive.resumeAfterRecording()
         if awake, router.activeURL != nil { startSense() }
     }
@@ -574,12 +575,19 @@ final class DeviceController: ObservableObject {
                 continue
             }
             do {
+                let ls = listen.snapshot
                 let reply = try await bridge.heartbeat(battery: currentBattery ?? -1,
                                                        charging: charging,
                                                        mode: awake ? "awake" : "standby",
                                                        deviceName: UIDevice.current.name,
                                                        lastError: lastError,
-                                                       channels: router.channelList.map { $0.payload })
+                                                       channels: router.channelList.map { $0.payload },
+                                                       listen: ["running": ls.isRunning,
+                                                                "wants": ls.wants,
+                                                                "callActive": ls.callActive,
+                                                                "segments": ls.segments,
+                                                                "pending": ls.pending,
+                                                                "lastError": ls.lastError])
                 router.noteSuccess()
                 connected = true
                 activeChannel = router.activeTag

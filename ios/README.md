@@ -257,7 +257,7 @@ SideStore 用 StosVPN 在本机完成签名刷新，不需要 AltServer 常驻�
 1. 后台保活不是 100%：内存压力、低电量模式、手动上滑、系统重启都会断，需要重新打开 App。后台**收音**比保活更苛刻：必须同时有音频输出（静音循环也算），否则系统 30 秒内就挂起。
 2. 后台时 CoreHaptics 不工作；后台也不能 `openApp`（iOS 限制）。
 3. 不能自动化别的 App 界面（没有 WDA/越狱）；只能 URL Scheme 跳到某个 App，或用快捷指令/分享扩展。
-4. `listen` / 实时通道只把音频传回电脑并落成 wav；**桥接侧还没接 ASR**，"听懂"需要另配 STT（见第 10 节）。
+4. `listen` 指令默认在手机端上识别成文字（WhisperKit，音频不出手机）；模型没准备好或识别失败时才回退上传音频、由桥接转写。实时通道的音频片段仍会落成 wav，桥接按队列转写（见第 10、11 节）。
 5. 首次连局域网时 iOS 会弹「本地网络」权限，拒了之后要 设置→隐私与安全性→本地网络 里手动打开。
 
 ---
@@ -328,6 +328,129 @@ Windows PowerShell 5.1 里用 curl.exe -d '{...}' 会被剥掉双引号变成 BA
 
 ### 10.6 还没做的（如实写）
 
-- **STT / TTS 闭环没接**：wav 已经按片段落盘，但桥接还没调用 whisper 与 7880 的 IndexTTS-2.5，所以"听→想→说"目前只完成了"听→落盘"和"桥接→说"两段。
+- **常驻通道的片段会转写，TTS 已接**：wav 片段由桥接的串行转写队列（`drainTranscribe`）处理，`say` 走手机本地 TTS 或 7880 克隆音色。真正没验证的是端到端延迟与真机后台续航（见下一条）。`listen` 指令默认改走手机端上识别，只有模型未就绪/识别失败才回退上传音频。
 - **P1 的三条验收指标全部未验证**（没有真机）：后台锁屏连续 30 分钟不中断、20 次延迟中位数 < 2.5s、连续 1 小时耗电。代码与桥接侧都能在 Windows 上跑通，但真机数据只能等装上去之后测。
 - 二进制的**下行**音频（服务端直接推 PCM 给手机播）协议留了位置，P1 没实现；现在说一句走的是 say 文本帧 + 手机本地 TTS，或 udioUrl 让手机下载播放。
+
+---
+
+## 11. 端上识别（A15）
+
+### 11.1 链路
+
+```
+listen 指令
+  → MicService 录音（16 kHz 单声道 wav；VAD 800–1000 ms 静音自动收尾，上限仍是 seconds）
+  → OnDeviceASR.transcribe（WhisperKit + CoreML，audioEncoder / textDecoder 走神经引擎）
+  → DeviceController 把文字 POST 到 ws 同端的 3102 /api/sense/utterance
+  → 桥接写 state/sense/utterances.jsonl，并回传 sttSource=device / sttMs / model
+  → 指令结果里不带 media：音频没有离开手机
+```
+
+失败兜底：模型未就绪、转写抛错、或识别结果为空 → 仍把这段 wav 作为 `media` 回传，桥接照旧调用 `transcribeLocalAudioDetailed`，返回 `sttSource=server`。这条旧路径没有改。
+
+### 11.2 SwiftPM 依赖
+
+| 项 | 值 |
+| --- | --- |
+| 包地址 | `https://github.com/argmaxinc/WhisperKit`（仓库已重定向到 `argmaxinc/argmax-oss-swift`） |
+| 版本 | **精确 0.9.0**（`exactVersion: 0.9.0`；不要用 1.x，API 有变动） |
+| 平台 | iOS 16.0+；建议 Xcode 16 编译（包内 swift-tools 5.10） |
+| Product | `WhisperKit` |
+
+`project.yml` 里已经写好：
+
+```yaml
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit
+    exactVersion: 0.9.0
+# target XiaoBeiMing:
+dependencies:
+  - package: WhisperKit
+```
+
+`xcodegen generate` 后 Xcode 会自动解析。手工添加也行：File → Add Package Dependencies… → 粘贴 URL → Dependency Rule 选 **Exact Version 0.9.0** → 加到 `XiaoBeiMing` target。
+
+### 11.3 Info.plist / 能力清单
+
+| 键 | 状态 | 用途 |
+| --- | --- | --- |
+| `NSMicrophoneUsageDescription` | 已有，文案补充「默认在手机本地识别成文字，音频不上传」 | 录音 + 端上识别 |
+| `UIBackgroundModes` = `audio` | 已有 | 后台保活 / 常驻听；不是给 ASR 无限跑用的 |
+| `NSLocalNetworkUsageDescription` | 已有 | 连 3101 / 3102 |
+| `NSAppTransportSecurity`（允许本地网络） | 已有 | 局域网 http/ws |
+| `ITSAppUsesNonExemptEncryption` = `false` | **新增** | 出口合规，省掉每次上传的加密问卷 |
+
+不需要新的 entitlement，也不需要单独的网络权限：模型和 tokenizer 走 HTTPS，第一次下载时系统只弹本地网络/麦克风（如尚未授权）。
+
+### 11.4 模型体积与内存
+
+| 模型 | 磁盘（权重合计） | 峰值内存（估算） | 说明 |
+| --- | --- | --- | --- |
+| `small` | ≈484 MB | 0.7–1.0 GB | 默认；准确率最好，A15 上 2 s 音频目标 ≤1.2 s 属于**目标值，需真机实测** |
+| `base` | ≈146 MB | 0.3–0.4 GB | small 下载/加载失败时自动回退 |
+| `tiny` | ≈76 MB | ≈0.15 GB | 最后兜底；准确率明显下降 |
+
+- 存放位置：`Application Support/XiaoBeiMing/Models/models/argmaxinc/whisperkit-coreml/openai_whisper-<variant>`。删 App 才会清掉；不想占空间可在设置里换 tiny 后手动删除旧目录。
+- **tokenizer 单独下载**：WhisperKit 的 `loadTokenizer` 从 HuggingFace `openai/whisper-<variant>` 取 `tokenizer.json`（几 MB），首次识别需要联网；`tokenizerFolder` 指向同一个 Models 目录，之后走缓存。
+- 首次加载会做 CoreML 预编译（`prewarm: true`），可能几十秒；设置页有进度和「准备模型」按钮，别在 `listen` 指令里等下载。
+- 内存压力：`small` 峰值接近 1 GB，低内存设备/后台被 jetsam 时识别会失败并自动回退上传音频。
+
+### 11.5 为什么不能在后台无限跑
+
+- iOS 的后台音频（`UIBackgroundModes: audio`）只在音频会话**持续有 I/O**时给执行时间；`KeepAlive` 的静音循环能保住进程，但那是为了麦克风和播放，不是给推理开无限 CPU。
+- Whisper 推理是一段 ANE/CPU 突发；App 退到后台且没有录音/播放时，系统约 30 秒内就会挂起，正在跑的推理可能被中断。所以端上识别只在「一次 listen / 前台/常驻听活跃」期间做，**不要指望它在后台连续转写几个小时**。
+- 模型下载也没有用后台下载 session（`useBackgroundDownloadSession: false`）：首次下载请在前台、充电、Wi-Fi 下做。
+- 真要在后台长跑，只能靠 audio session 持续保活（例如常驻听），代价是耗电和麦克风常开；这属于 P1 常驻通道的取舍，不是 ASR 能绕开的。
+
+### 11.6 开关与回退
+
+- 设置页「端上识别（A15）」：`useOnDeviceASR`（默认 **true**）、模型（默认 `small`）、静音收尾 800–1000 ms 可调。
+- 持久化：`AppSettings` → `UserDefaults` key `app.settings.v1`。
+- 指令参数 `onDeviceASR: false` 可强制走服务端；此外模型未就绪 / 转写异常 / 空文本也会自动回退。
+- 回退时音频照常上传，桥接返回 `sttSource=server`；端上成功时返回 `sttSource=device` 且 `mediaPath=null`。
+- 不想用端上识别：设置页关掉开关，或把 `onDeviceASR` 传 false；服务端转写路径与 QQ 语音条完全不受影响。
+
+### 11.7 桥接接口
+
+设备面（3102，设备令牌）：
+
+```powershell
+curl.exe -s -X POST -H "x-device-token: <设备token>" -H "content-type: application/json" `
+  --data-binary "@utt.json" http://127.0.0.1:3102/api/sense/utterance
+# utt.json: {"text":"今天下午三点开会","ms":870,"model":"small","durationSec":2.4,"source":"device","sessionId":"..."}
+
+curl.exe -s -H "x-device-token: <设备token>" "http://127.0.0.1:3102/api/sense/utterances?limit=5"
+```
+
+管理面（3100，主控令牌）同样有 `POST /api/sense/utterance` 与 `GET /api/sense/utterances`，方便脚本回归。写入 `state/sense/utterances.jsonl` 的字段与音频片段对齐：
+
+```json
+{"file":null,"durationSec":2.4,"transcript":"今天下午三点开会","at":"2026-10-29T15:38:27.011Z","ms":870,"source":"device","sttMs":870,"model":"small","sessionId":"..."}
+```
+
+文字事件**不会**再进 `drainTranscribe` 队列（已经识别过了）；空文本返回 400 `EMPTY_TEXT`，超长（>8000 字）返回 400 `TEXT_TOO_LONG`。
+
+### 11.8 构建与静态验证
+
+```powershell
+cd C:\Users\zwc\qq-bridge\ios
+xcodegen generate
+open XiaoBeiMing.xcodeproj   # 选 Team / 真机，Run
+```
+
+`project.yml` 里 `CODE_SIGNING_ALLOWED=NO`，真机运行前在 Xcode 的 Signing & Capabilities 里选自己的 Team（bundle id `com.xiaobeiming.senses` 可按需改）。
+
+**当前没有 Mac，也没有编译过**，只做了静态检查：
+
+```powershell
+node scripts/check-ios-sources.mjs
+# 101 通过 / 0 失败（13 个 Swift 文件）
+```
+
+新增 API 的完整签名列在 `ios/REPORT.md`。真机第一次跑请这样验：
+
+1. 设置页点「准备模型」，看到下载进度到 100%，状态变「已就绪 · small」。
+2. 触发一次 `phone_listen`，Xcode 控制台搜 `[ASR]`，应出现 `audio=...s stt=...ms chars=...`；这就是 A15 的实测耗时。
+3. `GET /api/sense/utterances?limit=5` 应看到 `source=device`；若看到 `sttSource=server` 且 `mediaPath` 非空，说明走了兜底，查设置页的 `lastError`。

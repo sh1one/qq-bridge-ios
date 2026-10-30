@@ -315,7 +315,8 @@ final class BridgeClient {
                    mode: String,
                    deviceName: String,
                    lastError: String,
-                   channels: [[String: Any]]) async throws -> HeartbeatReply {
+                   channels: [[String: Any]],
+                   listen: [String: Any] = [:]) async throws -> HeartbeatReply {
         var body: [String: Any] = [
             "battery": battery,
             "charging": charging,
@@ -324,6 +325,7 @@ final class BridgeClient {
             "appVersion": Self.appVersion(),
             "channels": channels
         ]
+        if !listen.isEmpty { body["listen"] = listen }
         if !lastError.isEmpty { body["lastError"] = lastError }
         let obj = try await send(path: "/api/device/heartbeat", method: "POST", body: body, timeout: 12)
         let dict = (obj as? [String: Any]) ?? [:]

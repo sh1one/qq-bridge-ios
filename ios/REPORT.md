@@ -2,7 +2,7 @@
 
 > 生成时间：2026-10-29（Europe/Rome）
 > 工作目录：`C:\Users\zwc\qq-bridge`
-> 约束遵守情况：未重启 DSH；桥接重启过两次（`启动桥接.bat` 的 :loop 自动拉起）；未新增 npm 依赖；iOS 侧零第三方库；所有新文件 UTF-8 无 BOM、纯 LF（已用 node 逐字节核对 `bom=false cr=false`）。
+> 约束遵守情况：未重启 DSH；桥接重启过三次（`启动桥接.bat` 的 :loop 自动拉起）；Node 侧未新增 npm 依赖；iOS 侧新增 WhisperKit 0.9.0（SwiftPM，端上识别用）；所有新文件 UTF-8 无 BOM、纯 LF（已用 node 逐字节核对 `bom=false cr=false`）。
 
 ## 1. 文件清单
 
@@ -276,3 +276,233 @@ runner：`macos-14`（Xcode 15.x）。步骤：`brew install xcodegen` → `xcod
 6. **吊销不可逆**：`POST /api/device/devices/revoke` 之后只能手改 `devices.json` 才能复活。
 7. **设备服务默认监听 0.0.0.0**（3101/3102）：局域网内可达，安全全靠 device token 与限流；不要把它暴露到公网而不加隧道/鉴权。
 8. **`mcp-snowluma-safe.js` 的 `phone_*` 工具需要重启 DSH 才生效**，本轮按约束没有重启 DSH —— 也就是说工具已经注册进代码，但当前 DSH 进程里还看不到它们。
+
+---
+
+## 12. 端上识别（A15）增量报告
+
+> 本节写于 2026-10-29 晚，**以本节为准**：第 7 节的 STT/TTS 结论、静态检查 88 项、文件行数都已过时；iOS 仍未编译。
+
+### 12.1 文件清单（本轮）
+
+| 文件 | 字节 | 行数 | 说明 |
+| --- | --- | --- | --- |
+| `src/sense-hub.js` | 34091 | 906 | 新增 `recordUtterance()`、3102 的 `POST/GET /api/sense/utterance(s)`、`deviceUtterances` 统计、导出 |
+| `src/bridge.js` | 798838 | 14396 | listen 结果区分 `sttSource=device/server/none`；控制台新增 `POST /api/sense/utterance` |
+| `src/device-tools.js` | 22561 | 406 | `phone_listen` 增加 `onDeviceASR`/`silenceMs`/`vad`，返回 `sttSource`/`sttMs` |
+| `scripts/test-device-utterance.mjs` | 12471 | 287 | **新增**：文字事件 + 端上 listen + `phone_listen` 文案回归（26 项） |
+| `scripts/test-phone-listen-stt.mjs` | 8593 | 183 | 旧链路回归脚本；summary 增加 `sttSource`/`sttMs` |
+| `scripts/check-ios-sources.mjs` | 10002 | 275 | import 白名单加 `CoreML`/`WhisperKit`，project.yml 检查加 SPM 包 |
+| `ios/Sources/AppSettings.swift` | 2528 | 65 | **新增**：模型选择、端上开关、VAD 参数 |
+| `ios/Sources/OnDeviceASR.swift` | 9790 | 246 | **新增**：WhisperKit 下载/加载/转写 + 进度 + 回退 |
+| `ios/Sources/App.swift` | 12801 | 304 | 设置页「端上识别（A15）」 |
+| `ios/Sources/DeviceController.swift` | 32006 | 753 | listen 接 VAD + 端上识别 + 文字事件 + 音频兜底 |
+| `ios/Sources/BridgeClient.swift` | 13926 | 335 | `senseBaseURL`、`postUtterance`、`send(base:)` |
+| `ios/Sources/SenseStream.swift` | 19395 | 509 | WS 端口修正到 3102；暴露 `sessionId` |
+| `ios/Sources/EndpointRouter.swift` | 10538 | 278 | `DeviceHubDefaults.sensePort = 3102` |
+| `ios/Sources/MicService.swift` | 7984 | 200 | VAD 静音收尾（800–1000 ms 可配）、`stoppedBy/speechSec/silenceMs/maxSec` |
+| `ios/project.yml` | 1634 | 61 | WhisperKit 0.9.0 包 + target 依赖 |
+| `ios/Info.plist` | 2815 | 83 | 麦克风文案 + `ITSAppUsesNonExemptEncryption=false` |
+| `ios/README.md` | 29677 | 456 | 新增第 11 节「端上识别（A15）」 |
+| `ios/REPORT.md` | 29483+ | 508+ | 本节 |
+
+### 12.2 Swift 新增/修改 API 签名
+
+**无法编译声明**：本机没有 `swiftc`/`swift`/Xcode（`Get-Command swiftc,swift` 为空），本轮**没有编译过**，也不能声称编译通过。只做了 `node scripts/check-ios-sources.mjs` 静态检查：**101 通过 / 0 失败（13 个 Swift 文件）**。
+
+```swift
+// AppSettings.swift
+enum OnDeviceModel: String, CaseIterable, Identifiable {
+    case tiny, base, small
+    var title: String
+    var shortName: String
+    var approxMB: Int
+    static func normalized(_ raw: String) -> OnDeviceModel
+}
+
+struct AppSettings: Codable, Equatable {
+    var useOnDeviceASR: Bool = true
+    var onDeviceModel: String = "small"
+    var vadSilenceMs: Int = 800
+    var vadThreshold: Double = 0.02
+    var model: OnDeviceModel { get }
+    var vadSilenceSeconds: Double { get }
+    static let storageKey: String = "app.settings.v1"
+    static func load(from defaults: UserDefaults = .standard) -> AppSettings
+    func save(to defaults: UserDefaults = .standard)
+}
+
+// OnDeviceASR.swift
+struct ASRResult {
+    let text: String
+    let ms: Int
+    let model: String
+}
+
+struct ASRState {
+    var isPreparing: Bool
+    var progress: Double
+    var status: String
+    var model: String
+    var lastError: String
+    var lastMs: Int?
+}
+
+enum ASRError: LocalizedError {
+    case notReady
+    case modelIncomplete(String)
+    case loadFailed(String)
+    var errorDescription: String? { get }
+}
+
+@MainActor
+final class OnDeviceASR {
+    var onUpdate: ((ASRState) -> Void)?
+    private(set) var state: ASRState
+    func isReady(preferredModel: String) -> Bool
+    @discardableResult
+    func prepare(preferredModel: String) async -> Bool
+    func transcribe(wavURL: URL, durationSec: Double, preferredModel: String) async throws -> ASRResult
+}
+
+// BridgeClient.swift
+var senseBaseURL: URL? { get }
+private func makeURL(_ path: String, base: URL? = nil) throws -> URL
+private func send(path: String, method: String, body: [String: Any]?,
+                  timeout: TimeInterval, base: URL? = nil) async throws -> Any
+@discardableResult
+func postUtterance(text: String, ms: Int, model: String,
+                   durationSec: Double, sessionId: String) async throws -> [String: Any]
+
+// SenseStream.swift
+var sessionId: String { get }   // snapshot.sessionId
+private func socketURL(baseURL: URL, token: String) -> URL?
+
+// EndpointRouter.swift
+enum DeviceHubDefaults {
+    static let port = 3101
+    static let sensePort = 3102
+}
+
+// DeviceController.swift
+@Published var settings: AppSettings
+@Published var asrState: ASRState
+private let asr: OnDeviceASR
+func updateAppSettings(useOnDeviceASR: Bool, model: OnDeviceModel,
+                       vadSilenceMs: Int, vadThreshold: Double)
+func prepareASR() async
+
+// MicService.swift（上一轮已存在，本轮接入 listen）
+func record(seconds: Int, silenceThreshold: Double = 0.01,
+            silenceMs: Int = 800, noVoiceGuardSec: Double = 2.5) async throws -> MicResult
+struct MicResult {
+    let url: URL
+    let durationSec: Double
+    let rms: Double
+    let peak: Double
+    let silent: Bool
+    var stoppedBy: String
+    var speechSec: Double
+    var silenceMs: Int
+    var maxSec: Double
+}
+```
+
+### 12.3 桥接改动与接口样例
+
+| 位置 | 改动 |
+| --- | --- |
+| `src/sense-hub.js:182` | `stats` 增加 `deviceUtterances` |
+| `src/sense-hub.js:222` | 新增 `recordUtterance(input)`：写入 `utterances.jsonl`，**不进** `drainTranscribe` |
+| `src/sense-hub.js:737` | 3102 `POST /api/sense/utterance`（设备令牌） |
+| `src/sense-hub.js:747` | 3102 `GET /api/sense/utterances?limit=`（设备令牌） |
+| `src/sense-hub.js:894` | 导出 `recordUtterance` |
+| `src/bridge.js:4702` | listen 结果优先取 `data.transcript`，`sttSource=device`，不调服务端转写 |
+| `src/bridge.js:4724` | 有音频时仍走 `transcribeLocalAudioDetailed`，标 `sttSource=server` |
+| `src/bridge.js:4932` | 控制台 `POST /api/sense/utterance`（主控令牌，测试/管理用） |
+| `src/device-tools.js:196` | `phone_listen` 默认请求端上识别，返回 `sttSource`/`sttMs` |
+
+请求（3102，设备令牌）：
+
+```http
+POST /api/sense/utterance
+x-device-token: <设备令牌>
+{"text":"今天下午三点开会","ms":870,"model":"small","durationSec":2.4,"source":"device","sessionId":"s-123"}
+
+→ 200 {"ok":true,"item":{"file":null,"durationSec":2.4,"transcript":"今天下午三点开会",
+       "at":"2026-10-29T15:38:27.011Z","ms":870,"source":"device","sttMs":870,
+       "model":"small","sessionId":"s-123"}}
+→ 400 {"ok":false,"code":"EMPTY_TEXT","error":"text 不能为空"}
+```
+
+```http
+GET /api/sense/utterances?limit=5
+x-device-token: <设备令牌>
+→ 200 {"ok":true,"total":3,"limit":5,"path":"...utterances.jsonl","items":[ ... ]}
+```
+
+### 12.4 假手机实测输出
+
+新脚本 `scripts/test-device-utterance.mjs`（不依赖真机/真录音）：**26 通过 / 0 失败**。
+
+- 无令牌：3102 与 3100 的 POST 均 `401`（`UNAUTHORIZED`）。
+- 直传文字：`durationSec=1.62 ms=812 model=small`，返回/`?limit=5`/jsonl 三处字段一致。
+- 完整 `listen`（`seconds=3`，假手机 2.4 s 后回文字 + 无 media）：
+
+```json
+{
+  "file": null,
+  "durationSec": 2.4,
+  "transcript": "端上识别工具测试 1793288309708",
+  "at": "2026-10-29T15:38:33.363Z",
+  "ms": 870,
+  "source": "device",
+  "sttMs": 870,
+  "model": "small",
+  "sessionId": "fake-session-e2e"
+}
+```
+
+```
+sttSource=device  sttMs=870  mediaPath=null
+listen 总耗时 3078ms（录音 2400ms + 桥接开销），远低于旧链路 8.7s 量级
+phone_listen 工具文案耗时 2946ms
+```
+
+- 旧链路兜底（假手机只回 wav、不回文字）：
+
+```json
+{
+  "httpStatus": 200, "ok": true,
+  "transcript": "今天下午3点开会",
+  "transcriptMs": 847, "sttSource": "server", "sttMs": 847,
+  "sttModel": "small", "audioMs": 3471,
+  "mediaPath": "C:\\Users\\zwc\\qq-bridge\\state\\device\\media\\cmvtptaehbfa9a333.wav",
+  "elapsedMs": 862
+}
+```
+
+说明：`listen` 有限流（2 次/60 秒）且会与 QQ 机器人的 say/listen 抢同一个设备队列，本轮前两次分别撞上 `RATE_LIMITED` 与 120 s `TIMEOUT`，等窗口后重跑成功；这是测试环境并发，不是代码路径失败。
+
+### 12.5 构建清单
+
+| 项 | 值 |
+| --- | --- |
+| SPM | `https://github.com/argmaxinc/WhisperKit`，**Exact Version 0.9.0**（重定向到 argmax-oss-swift） |
+| 工程 | `project.yml` 已写 `packages` + `dependencies`；`xcodegen generate` |
+| Info.plist | `NSMicrophoneUsageDescription`（已改文案）、`UIBackgroundModes=[audio]`（已有）、`NSLocalNetworkUsageDescription`（已有）、`ITSAppUsesNonExemptEncryption=false`（新增） |
+| 模型 | 默认 `small` ≈484 MB；回退 `base` ≈146 MB、`tiny` ≈76 MB |
+| 峰值内存 | small 0.7–1.0 GB，base 0.3–0.4 GB，tiny ≈0.15 GB（估算，需真机 Instruments 验证） |
+| 存放 | `Application Support/XiaoBeiMing/Models/models/argmaxinc/whisperkit-coreml/openai_whisper-<variant>` |
+| 首次联网 | 模型 + tokenizer（`openai/whisper-<variant>` 的 tokenizer.json，几 MB）；之后缓存 |
+| 编译器 | 建议 Xcode 16（包 swift-tools 5.10）；deployment target iOS 16.0 |
+
+### 12.6 回退开关与残留风险
+
+- **开关**：设置页 `useOnDeviceASR`（默认 true）；`phone_listen` 的 `onDeviceASR:false` 可单次强制服务端；模型未就绪/转写抛错/空文本自动回退。
+- **失败不丢音频**：回退分支仍附 wav，服务端 `transcribeLocalAudioDetailed` 路径原样保留，QQ 语音条不受影响。
+- **残留风险 1（最大）**：没有 Mac，**一次都没编译**。WhisperKit 0.9.0 的 `WhisperKitConfig`/`ModelComputeOptions`/`DecodingOptions` 签名按源码核对过，但 Swift 的 actor 隔离（`@MainActor` + `await` 跨 actor）、`URLSession` 回调与 SwiftUI `Picker` 泛型仍可能在首次 `xcodebuild` 报错。
+- **残留风险 2**：`small` 在 A15 上 2 s 音频 ≤1.2 s 只是目标值；`audioEncoderCompute: .cpuAndNeuralEngine` 在 iOS 16 上是否被 CoreML 接受、首帧是否掉速，要真机 `[ASR]` 日志确认。内存峰值接近 1 GB，后台可能被 jetsam。
+- **残留风险 3**：端上识别与文字事件是两步：先本地转写，再 POST 3102。若 3102 不可达（防火墙/隧道只开了 3101），识别仍成功、`report` 仍带文字，但 `utterances.jsonl` 不会有这条；`data.utterancePostError` 会记录原因。
+- **残留风险 4**：WS 端口修正为 3102 后，之前依赖「3101 也代理 WS」的部署会失效；README 已写明 3102 必须放行。
+- **未在真机验证**：后台连续识别、模型下载中断续传、低电量模式、麦克风被其他 App 占用。

@@ -38,6 +38,8 @@ struct ListenSnapshot {
     /// 还没转写完的段数，用来观察积压。
     var pending = 0
     var lastSegmentMs = 0
+    /// 用户「想要一直听」的意图（持久化）。系统重置通话后按这个决定要不要自己拉回来。
+    var wants = false
 }
 
 /// 常驻监听（CallKit 版）：让 App 表现得像一通正在进行的语音通话，锁屏/后台继续用麦克风。
@@ -121,7 +123,12 @@ final class ListenMode: NSObject, CXProviderDelegate {
     private var callUUID: UUID?
     private var callStarted = false
     private var restartScheduled = false
+    private var autoRestartScheduled = false
+    /// 最近几次自动重拉的时刻，用来防"重置→重拉→再重置"的死循环。
+    private var autoRestartTimes: [Date] = []
     private var observers: [NSObjectProtocol] = []
+    /// 「用户想要一直听」的持久化标记：真机重启/系统重置通话后靠它自己拉回来。
+    private static let wantsKey = "listenWanted.v1"
 
     private struct Runtime {
         var baseURL: URL?
@@ -169,6 +176,9 @@ final class ListenMode: NSObject, CXProviderDelegate {
     @discardableResult
     func start(config newConfig: Config? = nil) -> Bool {
         if isRunning { return true }
+        // 一旦起过就记住「用户想一直听」，系统重置通话后才能自己拉回来。
+        UserDefaults.standard.set(true, forKey: Self.wantsKey)
+        runSync { self.state.wants = true }
         guard hasPermission() else {
             fail(ListenError.permission)
             return false
@@ -238,6 +248,13 @@ final class ListenMode: NSObject, CXProviderDelegate {
         try? session.setActive(false, options: [.notifyOthersOnDeactivation])
         emit()
         print("[LISTEN] stopped")
+    }
+
+    /// 用户主动在设置页关掉：连「想听」的意图一起清掉，之后系统再重置也不会自己拉起。
+    func stopByUser() {
+        UserDefaults.standard.set(false, forKey: Self.wantsKey)
+        runSync { self.state.wants = false }
+        stop()
     }
 
     private func resetSegmentState() {
@@ -599,11 +616,52 @@ final class ListenMode: NSObject, CXProviderDelegate {
     // MARK: - CXProviderDelegate
 
     func providerDidReset(_ provider: CXProvider) {
-        // 系统把通话状态清了（重启、权限被撤销等）：必须自己收尾，否则会留下一个半死的 engine。
+        // 系统把通话状态清了（重启、权限被撤销等）：先自己收尾，否则会留下一个半死的 engine。
+        // 如果用户本来就想要「一直听」，收尾之后自动再拉一次——熄屏/后台也走这条路。
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.report(error: "系统重置了通话状态，常驻监听已停止")
+            let wants = self.isWanted
+            self.report(error: wants ? "系统重置了通话状态，正在自动恢复常驻监听" : "系统重置了通话状态，常驻监听已停止")
             self.stop()
+            if wants { self.scheduleAutoRestart() }
+        }
+    }
+
+    /// 「用户想听」的口径：内存状态与持久化标记任一为真即算（防止刚启动时状态还没同步）。
+    private var isWanted: Bool {
+        runSync { self.state.wants } || UserDefaults.standard.bool(forKey: Self.wantsKey)
+    }
+
+    /// 被系统收走通话后自己拉回来。延迟 1.5 秒是给 CallKit 和音频会话留落定时间：
+    /// 立刻再 report 一通，很容易触发第二次重置（真机上试过）。
+    /// 五分钟里连着重置 5 次就停手，否则会陷入"重置→重拉→再重置"的死循环，白耗电还吵。
+    private func scheduleAutoRestart() {
+        guard !autoRestartScheduled else { return }
+        let now = Date()
+        autoRestartTimes = autoRestartTimes.filter { now.timeIntervalSince($0) < 300 }
+        guard autoRestartTimes.count < 5 else {
+            report(error: "通话反复被系统重置（5 分钟内 \(autoRestartTimes.count) 次），已停止尝试；请重新打开常驻监听")
+            UserDefaults.standard.set(false, forKey: Self.wantsKey)
+            runSync { self.state.wants = false }
+            return
+        }
+        autoRestartTimes.append(now)
+        autoRestartScheduled = true
+        print("[LISTEN] 计划自动恢复")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self else { return }
+            self.autoRestartScheduled = false
+            guard self.isWanted, !self.isRunning else { return }
+            guard self.hasPermission() else {
+                self.report(error: "自动恢复失败：麦克风权限已失效")
+                return
+            }
+            if self.start() {
+                print("[LISTEN] 已自动恢复")
+            } else {
+                let reason = self.snapshot.lastError
+                self.report(error: "自动恢复失败：\(reason.isEmpty ? "未知原因" : reason)")
+            }
         }
     }
 
