@@ -40,8 +40,8 @@ struct ListenSnapshot {
     var lastSegmentMs = 0
     /// 用户「想要一直听」的意图（持久化）。系统重置通话后按这个决定要不要自己拉回来。
     var wants = false
-    /// 采集链路诊断：tap 收到多少帧、最近电平峰值多少。
-    /// 用来区分两种"0 段"：frames 不涨 = 麦克风根本没数据；frames 涨但 peak 远低于阈值 = 阈值/增益问题。
+    /// 采集诊断：tap 收到多少帧、近期电平峰值。
+    /// frames 不涨 = 麦克风没数据；frames 涨而 peak ≈ 0 = 会话被系统静音（降级模式踩过）。
     var frames = 0
     var peak: Double = 0
 }
@@ -130,6 +130,10 @@ final class ListenMode: NSObject, CXProviderDelegate {
     private var autoRestartScheduled = false
     /// 最近几次自动重拉的时刻，用来防"重置→重拉→再重置"的死循环。
     private var autoRestartTimes: [Date] = []
+    /// 静音看门狗：tap 有数据但电平一直是 0，说明音频会话被系统静音了（降级模式的典型症状）。
+    private var lastAudibleAt = Date()
+    private var lastSilenceCheck = Date()
+    private var silentRecoveries = 0
     private var observers: [NSObjectProtocol] = []
     /// 「用户想要一直听」的持久化标记：真机重启/系统重置通话后靠它自己拉回来。
     private static let wantsKey = "listenWanted.v1"
@@ -193,7 +197,7 @@ final class ListenMode: NSObject, CXProviderDelegate {
             runSync { self.config = newConfig }
         }
         do {
-            try activateSession()
+            try activateSession(forCall: withCall)
         } catch {
             fail(ListenError.session(error.localizedDescription))
             return false
@@ -228,6 +232,10 @@ final class ListenMode: NSObject, CXProviderDelegate {
             return false
         }
         installObservers()
+        // 新的一轮采集：静音看门狗从这里重新计时，否则上一次的静音记录会立刻触发一次自愈。
+        lastAudibleAt = Date()
+        lastSilenceCheck = Date()
+        silentRecoveries = 0
         emit()
         print("[LISTEN] started")
         return true
@@ -277,16 +285,21 @@ final class ListenMode: NSObject, CXProviderDelegate {
 
     /// `.voiceChat + .mixWithOthers` 在部分机型/外接音频设备上会被拒，所以退两级：
     /// 先按约定配，拒了就只保留蓝牙，再不行就裸配置——录音本身比混音重要。
-    private func activateSession() throws {
+    ///
+    /// `forCall = false` 是降级路径：不在通话里还用 `.voiceChat`，iOS 会把麦克风当成
+    /// "等待通话上行"而一直给静音（实测 tap 每秒 20 多帧在来，peak 只有 0.0006）。
+    /// 所以降级时必须换回 `.default`，采集才是真实麦克风信号。
+    private func activateSession(forCall: Bool = true) throws {
+        let mode: AVAudioSession.Mode = forCall ? .voiceChat : .default
         do {
             try session.setCategory(.playAndRecord,
-                                    mode: .voiceChat,
-                                    options: [.mixWithOthers, .allowBluetooth])
+                                    mode: mode,
+                                    options: [.mixWithOthers, .allowBluetooth, .defaultToSpeaker])
         } catch {
             do {
-                try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
+                try session.setCategory(.playAndRecord, mode: mode, options: [.allowBluetooth])
             } catch {
-                try session.setCategory(.playAndRecord, mode: .voiceChat, options: [])
+                try session.setCategory(.playAndRecord, mode: mode, options: [])
             }
         }
         try session.setActive(true, options: [])
@@ -366,11 +379,40 @@ final class ListenMode: NSObject, CXProviderDelegate {
     // MARK: - 切段状态机
 
     /// 串行队列。所有时长都按「实际帧长」累加，不假设固定 buffer 大小（48k 时一帧 42ms，16k 时 128ms）。
+    /// 有帧但没声音 = 麦克风被系统静音（降级模式最典型的症状）。
+    /// 连续 6 秒没有任何一帧超过 -54 dB，就重激活会话并重建采集；两次无效后明确报错，
+    /// 不再无限重试——重试只会白耗电，而且把真正的原因藏起来。
+    private func watchSilentInput(rms: Float) {
+        let now = Date()
+        if rms >= 0.002 { lastAudibleAt = now }
+        guard now.timeIntervalSince(lastAudibleAt) >= 6,
+              now.timeIntervalSince(lastSilenceCheck) >= 6 else { return }
+        lastSilenceCheck = now
+        guard silentRecoveries < 2 else {
+            if state.lastError.isEmpty {
+                report(error: "麦克风一直是静音：系统没把输入交给我们。先接一次电话，或关掉重开常驻监听再试")
+            }
+            return
+        }
+        silentRecoveries += 1
+        let attempt = silentRecoveries
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.report(error: "麦克风输入是静音，正在重建录音（第 \(attempt) 次）")
+            do {
+                try self.activateSession(forCall: self.callStarted)
+                try self.startCapture()
+            } catch {
+                self.report(error: "静音自愈失败：\(Self.describe(error))")
+            }
+        }
+    }
+
     private func ingest(_ samples: [Float], rms: Float) {
-        // 诊断计数：tap 是否真的在来数据、电平有没有到阈值，靠这两个数在心跳里看。
-        // 采不到音时 frames 不涨；frames 涨而 peak 长期 < threshold 才是阈值问题。
+        // 诊断 + 自愈：先记帧数与峰值，再判断是不是"有数据但没声音"。
         state.frames += 1
         state.peak = max(state.peak * 0.95, Double(rms))
+        watchSilentInput(rms: rms)
         guard state.isRunning, !samples.isEmpty else { return }
         let frameMs = Double(samples.count) / config.sampleRate * 1000
         let voiced = Double(rms) >= config.threshold
@@ -674,7 +716,9 @@ final class ListenMode: NSObject, CXProviderDelegate {
             self.restartScheduled = false
             guard self.isRunning else { return }
             do {
-                try self.activateSession()
+                // 有通话按通话模式配；降级（没有通话）必须用 .default，
+                // 否则 .voiceChat 会把麦克风当"等待上行"而一直喂静音。
+                try self.activateSession(forCall: self.callStarted)
                 try self.startCapture()
                 print("[LISTEN] capture restarted (\(reason))")
             } catch {
